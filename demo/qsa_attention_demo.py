@@ -42,6 +42,7 @@ from backends import (  # noqa: E402
     qsa_topk,
     resolve_backend,
 )
+from profiling import nvtx_range  # noqa: E402
 from ref_ops import (  # noqa: E402
     apply_rope_full,
     assert_close,
@@ -87,38 +88,40 @@ class QSAAttentionDemo(nn.Module):
 
     def project_main(self, x: torch.Tensor, freqs: torch.Tensor, positions: torch.Tensor):
         cfg = self.cfg
-        qkv = self.qkv(x)
-        q_size = cfg.num_heads * cfg.head_dim
-        kv_size = cfg.num_kv_heads * cfg.head_dim
-        q, k, v, gate = qkv.split([q_size, kv_size, kv_size, q_size], dim=-1)
-        q = q.view(-1, cfg.num_heads, cfg.head_dim)
-        k = k.view(-1, cfg.num_kv_heads, cfg.head_dim)
-        v = v.view(-1, cfg.num_kv_heads, cfg.head_dim)
-        gate = gate.view(-1, cfg.num_heads, cfg.head_dim)
-        q = gemma_rms_norm(q, self.q_norm_w)
-        k = gemma_rms_norm(k, self.k_norm_w)
-        f = freqs[positions]
-        q = apply_rope_full(q, f)
-        k = apply_rope_full(k, f)
+        with nvtx_range("qsa/project_main (qkv_proj->norm->rope)"):
+            qkv = self.qkv(x)
+            q_size = cfg.num_heads * cfg.head_dim
+            kv_size = cfg.num_kv_heads * cfg.head_dim
+            q, k, v, gate = qkv.split([q_size, kv_size, kv_size, q_size], dim=-1)
+            q = q.view(-1, cfg.num_heads, cfg.head_dim)
+            k = k.view(-1, cfg.num_kv_heads, cfg.head_dim)
+            v = v.view(-1, cfg.num_kv_heads, cfg.head_dim)
+            gate = gate.view(-1, cfg.num_heads, cfg.head_dim)
+            q = gemma_rms_norm(q, self.q_norm_w)
+            k = gemma_rms_norm(k, self.k_norm_w)
+            f = freqs[positions]
+            q = apply_rope_full(q, f)
+            k = apply_rope_full(k, f)
         return q, k, v, gate
 
     def project_index(self, x: torch.Tensor, freqs_idx: torch.Tensor, positions: torch.Tensor):
         cfg = self.cfg
-        qk = self.index_qk(x)
-        q, k = qk.split(
-            [
-                cfg.indexer_n_heads * cfg.indexer_head_dim,
-                cfg.indexer_kv_heads * cfg.indexer_head_dim,
-            ],
-            dim=-1,
-        )
-        q = q.view(-1, cfg.indexer_n_heads, cfg.indexer_head_dim)
-        k = k.view(-1, cfg.indexer_kv_heads, cfg.indexer_head_dim)
-        q = gemma_rms_norm(q, self.iq_norm_w)
-        k = gemma_rms_norm(k, self.ik_norm_w)
-        f = freqs_idx[positions]
-        q = apply_rope_full(q, f)
-        k = apply_rope_full(k, f)
+        with nvtx_range("qsa/project_index (index_qk->norm->rope)"):
+            qk = self.index_qk(x)
+            q, k = qk.split(
+                [
+                    cfg.indexer_n_heads * cfg.indexer_head_dim,
+                    cfg.indexer_kv_heads * cfg.indexer_head_dim,
+                ],
+                dim=-1,
+            )
+            q = q.view(-1, cfg.indexer_n_heads, cfg.indexer_head_dim)
+            k = k.view(-1, cfg.indexer_kv_heads, cfg.indexer_head_dim)
+            q = gemma_rms_norm(q, self.iq_norm_w)
+            k = gemma_rms_norm(k, self.ik_norm_w)
+            f = freqs_idx[positions]
+            q = apply_rope_full(q, f)
+            k = apply_rope_full(k, f)
         return q, k
 
 
@@ -145,10 +148,11 @@ def build_context_caches(
     iq_all, ik_all = model.project_index(hidden, freqs_idx, positions)
 
     # Compress index keys by groups of compress_ratio
-    ratio = cfg.compress_ratio
-    n_full = (s // ratio) * ratio
-    groups = ik_all[:n_full].view(-1, ratio, cfg.indexer_kv_heads, cfg.indexer_head_dim)
-    compressed = average_pool_qsa_keys(groups)  # [G, 1, Dh]
+    with nvtx_range("qsa/compress_index_keys (average_pool_qsa_keys)"):
+        ratio = cfg.compress_ratio
+        n_full = (s // ratio) * ratio
+        groups = ik_all[:n_full].view(-1, ratio, cfg.indexer_kv_heads, cfg.indexer_head_dim)
+        compressed = average_pool_qsa_keys(groups)  # [G, 1, Dh]
     return {
         "hidden": hidden,
         "q_all": q_all,
@@ -176,7 +180,8 @@ def run_forward(
         dtype = torch.float64
 
     model = QSAAttentionDemo(cfg, device, dtype)
-    caches = build_context_caches(model, cfg, backend, seed=seed)
+    with nvtx_range("qsa/build_context_caches"):
+        caches = build_context_caches(model, cfg, backend, seed=seed)
     s, t = cfg.context_len, cfg.num_tokens
     # Query = last t tokens
     q = caches["q_all"][-t:]
@@ -195,14 +200,15 @@ def run_forward(
     # Ensure at least 1 block when possible
     row_ends = torch.maximum(row_ends, torch.minimum(row_starts + 1, row_ends.new_tensor(n_blocks)))
 
-    logits = qsa_mqa_logits_prefill(
-        backend,
-        iq,
-        compressed,
-        row_starts,
-        row_ends,
-        score_scale=math.sqrt(cfg.indexer_head_dim),
-    )
+    with nvtx_range("qsa/mqa_logits_prefill"):
+        logits = qsa_mqa_logits_prefill(
+            backend,
+            iq,
+            compressed,
+            row_starts,
+            row_ends,
+            score_scale=math.sqrt(cfg.indexer_head_dim),
+        )
     # logits may be [T, n_blocks] or wider; trim
     if logits.shape[-1] > n_blocks:
         logits = logits[..., :n_blocks]
@@ -217,32 +223,36 @@ def run_forward(
     block_topk = max(1, min(token_topk // cfg.compress_ratio, n_blocks))
     # If we clamped block_topk to n_blocks, shrink token_topk to match expand API.
     token_topk = block_topk * cfg.compress_ratio
-    block_indices = qsa_topk(backend, logits, row_starts, row_ends, block_topk)
+    with nvtx_range("qsa/fast_topk (block selection)"):
+        block_indices = qsa_topk(backend, logits, row_starts, row_ends, block_topk)
 
     # Expand blocks -> logical token indices
-    seq_lens = torch.full((t,), s, dtype=torch.int32, device=device)
-    q_pos = query_pos.to(torch.int32)
-    try:
-        logical = torch_expand_qsa_block_indices(
-            block_indices,
-            q_pos,
-            seq_lens,
-            cfg.compress_ratio,
-            token_topk,
-        )
-    except Exception as exc:
-        print(f"  [warn] torch_expand failed ({exc}); using fallback expander")
-        logical = _fallback_expand(block_indices, cfg.compress_ratio, s)
+    with nvtx_range("qsa/expand_block_indices (blocks->logical tokens)"):
+        seq_lens = torch.full((t,), s, dtype=torch.int32, device=device)
+        q_pos = query_pos.to(torch.int32)
+        try:
+            logical = torch_expand_qsa_block_indices(
+                block_indices,
+                q_pos,
+                seq_lens,
+                cfg.compress_ratio,
+                token_topk,
+            )
+        except Exception as exc:
+            print(f"  [warn] torch_expand failed ({exc}); using fallback expander")
+            logical = _fallback_expand(block_indices, cfg.compress_ratio, s)
 
     # Flatten cache: physical == logical
     physical = logical.clone()
     # Clamp invalid (-1) slots: reference ignores negative via mask
-    out = qsa_sparse_attention(
-        backend, q, k_cache, v_cache, physical, softmax_scale=cfg.head_dim**-0.5
-    )
-    if cfg.attn_output_gate:
-        out = out * torch.sigmoid(gate)
-    y = model.o_proj(out.reshape(t, -1))
+    with nvtx_range("qsa/sparse_attention (gathered GQA)"):
+        out = qsa_sparse_attention(
+            backend, q, k_cache, v_cache, physical, softmax_scale=cfg.head_dim**-0.5
+        )
+    with nvtx_range("qsa/output (gate * sigmoid -> o_proj)"):
+        if cfg.attn_output_gate:
+            out = out * torch.sigmoid(gate)
+        y = model.o_proj(out.reshape(t, -1))
     return {
         "q": q,
         "k_cache": k_cache,

@@ -10,3 +10,10 @@ venv/
 .env
 .env.*
 *.log
+
+# Nsight Systems / profiling artifacts
+reports/
+*.nsys-rep
+*.qdrep
+*.sqlite
+*.qdstrm

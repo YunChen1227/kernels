@@ -79,6 +79,53 @@ python D:\workspace\kernels\demo\run_all.py --backend sm120 --check-parity
 2. **Cross-backend:** `sm120` vs `cpu_ref` (`--check-parity`).
 3. **fp64 baseline:** reports fp32 max relative error on CPU.
 
+## Nsight Systems profiling (pipeline / data-flow timeline)
+
+The demos are annotated with **NVTX ranges** so each attention pipeline stage
+shows up as its own named band on the Nsight Systems timeline instead of one
+anonymous blob of CUDA kernels:
+
+- **DSV4:** `q_path` → `kv_path` → `compressor` → `indexer` → `gather_keys` →
+  `combined_attention` → `forward_out`
+- **QSA:** `project_main` / `project_index` → `compress_index_keys` →
+  `mqa_logits_prefill` → `fast_topk` → `expand_block_indices` →
+  `sparse_attention` → `output`
+
+Instrumentation lives in [`demo/profiling.py`](demo/profiling.py) and is a
+zero-cost no-op on the current CPU-only torch build (NVTX simply doesn't emit),
+so it only "lights up" under `nsys` on the SM120 GPU box. Disable it anytime
+with `KERNELS_NVTX=0`.
+
+### Quick start
+
+```powershell
+# Fast smoke capture (tiny shapes). Works on CPU (NVTX+CUDA-API rows only).
+.\profile.ps1 -Only qsa -Tiny
+
+# Full capture on the RTX 5070 Ti with a stats summary:
+.\profile.ps1 -Backend sm120 -Only all -Iters 20 -Stats
+```
+
+`profile.ps1` requires the Nsight Systems CLI (`nsys`) on PATH (ships with the
+CUDA Toolkit, or install standalone). Reports land in `reports/*.nsys-rep`;
+open them with `nsys-ui`.
+
+### How it works
+
+- [`demo/profile_nsys.py`](demo/profile_nsys.py) builds the model once, runs
+  unrecorded **warmup** iters, then a `cudaProfilerStart/Stop` region of
+  steady-state iters (each wrapped in an `iterN` NVTX range).
+- `profile.ps1` invokes `nsys profile --trace=cuda,nvtx,osrt,cudnn,cublas
+  --capture-range=cudaProfilerApi --capture-range-end=stop`, so the report
+  contains **only** the steady-state passes — warmup and model construction are
+  excluded.
+
+Run the driver directly (no profiler) to sanity-check it:
+
+```powershell
+D:\conda\python.exe D:\workspace\kernels\demo\profile_nsys.py --only qsa --tiny --iters 3
+```
+
 ## Import shim
 
 ```python

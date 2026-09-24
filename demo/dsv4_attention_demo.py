@@ -32,6 +32,7 @@ from _compat import bootstrap  # noqa: E402
 bootstrap()
 
 from backends import BackendCaps, dsv4_combined_attention, resolve_backend  # noqa: E402
+from profiling import nvtx_range  # noqa: E402
 from ref_ops import (  # noqa: E402
     assert_close,
     dense_mla_causal,
@@ -98,50 +99,54 @@ class DSV4AttentionDemo(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         cfg = self.cfg
         # Q path
-        q_lora = self.wq_a(x)
-        q_lora = rms_norm(q_lora, self.q_norm_w)
-        q = self.wq_b(q_lora).view(-1, cfg.num_heads, cfg.head_dim)
-        q = rope_tail(q, freqs[positions], cfg.qk_rope_head_dim)
+        with nvtx_range("dsv4/q_path (wq_a->rmsnorm->wq_b->rope)"):
+            q_lora = self.wq_a(x)
+            q_lora = rms_norm(q_lora, self.q_norm_w)
+            q = self.wq_b(q_lora).view(-1, cfg.num_heads, cfg.head_dim)
+            q = rope_tail(q, freqs[positions], cfg.qk_rope_head_dim)
 
         # KV path -> append to cache
-        kv = self.wkv(x)
-        kv = rms_norm(kv, self.kv_norm_w)
-        kv = rope_tail(kv.unsqueeze(1), freqs[positions], cfg.qk_rope_head_dim).squeeze(1)
-        # Demo: treat input tokens as the newest T positions of a length-S cache.
-        s = kv_cache.shape[0]
-        t = x.shape[0]
-        kv_cache = kv_cache.clone()
-        kv_cache[s - t :] = kv
+        with nvtx_range("dsv4/kv_path (wkv->rmsnorm->rope->cache)"):
+            kv = self.wkv(x)
+            kv = rms_norm(kv, self.kv_norm_w)
+            kv = rope_tail(kv.unsqueeze(1), freqs[positions], cfg.qk_rope_head_dim).squeeze(1)
+            # Demo: treat input tokens as the newest T positions of a length-S cache.
+            s = kv_cache.shape[0]
+            t = x.shape[0]
+            kv_cache = kv_cache.clone()
+            kv_cache[s - t :] = kv
 
         # Compressor ratio-2 over the full context (aligned pairs)
         # For simplicity, compress consecutive pairs of the existing cache.
-        n_pairs = s // cfg.compress_ratio
-        # Project from a synthetic hidden for pairs: use mean of pair KV as proxy
-        # to avoid needing historical hidden states. Gate uses random projection
-        # of the same proxy — enough to exercise pool_pairs math.
-        kv_pairs = kv_cache[: n_pairs * cfg.compress_ratio].view(
-            n_pairs, cfg.compress_ratio, cfg.kv_lora_rank
-        )
-        # Rebuild scores via wgate/wkv_c on a placeholder hidden = kv (demo only)
-        # Real model uses x; here we just need shapes/math of pool_pairs.
-        score_pairs = torch.randn_like(kv_pairs)
-        compressed = pool_pairs(kv_pairs.float(), score_pairs.float()).to(kv.dtype)
-        compressed = rms_norm(compressed, self.c_norm_w)
-        compressed = rope_tail(
-            compressed.unsqueeze(1),
-            freqs[torch.arange(0, n_pairs * cfg.compress_ratio, cfg.compress_ratio, device=x.device)],
-            cfg.qk_rope_head_dim,
-        ).squeeze(1)
+        with nvtx_range("dsv4/compressor (pool_pairs->rmsnorm->rope)"):
+            n_pairs = s // cfg.compress_ratio
+            # Project from a synthetic hidden for pairs: use mean of pair KV as proxy
+            # to avoid needing historical hidden states. Gate uses random projection
+            # of the same proxy — enough to exercise pool_pairs math.
+            kv_pairs = kv_cache[: n_pairs * cfg.compress_ratio].view(
+                n_pairs, cfg.compress_ratio, cfg.kv_lora_rank
+            )
+            # Rebuild scores via wgate/wkv_c on a placeholder hidden = kv (demo only)
+            # Real model uses x; here we just need shapes/math of pool_pairs.
+            score_pairs = torch.randn_like(kv_pairs)
+            compressed = pool_pairs(kv_pairs.float(), score_pairs.float()).to(kv.dtype)
+            compressed = rms_norm(compressed, self.c_norm_w)
+            compressed = rope_tail(
+                compressed.unsqueeze(1),
+                freqs[torch.arange(0, n_pairs * cfg.compress_ratio, cfg.compress_ratio, device=x.device)],
+                cfg.qk_rope_head_dim,
+            ).squeeze(1)
 
         # Indexer: score compressed positions
-        iq = self.wi_q(x).view(-1, cfg.index_n_heads, cfg.index_head_dim)
-        ik = self.wi_k(compressed)  # [C, Dh]
-        weights = F.relu(self.w_index(x))  # [T, Hidx]
-        # logits [T, C]
-        logits = torch.einsum("thd,cd->thc", iq.float(), ik.float())
-        logits = (logits.relu() * weights.unsqueeze(-1)).sum(dim=1)
-        k_sel = min(cfg.index_topk, compressed.shape[0])
-        topk_idx = logits.topk(k_sel, dim=-1).indices  # [T, K]
+        with nvtx_range("dsv4/indexer (wi_q/wi_k->logits->topk)"):
+            iq = self.wi_q(x).view(-1, cfg.index_n_heads, cfg.index_head_dim)
+            ik = self.wi_k(compressed)  # [C, Dh]
+            weights = F.relu(self.w_index(x))  # [T, Hidx]
+            # logits [T, C]
+            logits = torch.einsum("thd,cd->thc", iq.float(), ik.float())
+            logits = (logits.relu() * weights.unsqueeze(-1)).sum(dim=1)
+            k_sel = min(cfg.index_topk, compressed.shape[0])
+            topk_idx = logits.topk(k_sel, dim=-1).indices  # [T, K]
 
         return q, kv_cache, compressed, topk_idx
 
@@ -233,24 +238,28 @@ def run_forward(
     )
     kv_cache = torch.randn(s, cfg.kv_lora_rank, device=device, dtype=dtype)
 
-    q, kv_cache, compressed, topk_idx = model.forward_prepare(
-        x, positions, freqs, kv_cache
-    )
-    keys = model.gather_keys(
-        positions,
-        kv_cache,
-        compressed,
-        topk_idx,
-        use_indexer=use_indexer,
-        use_compressor=use_compressor,
-        window_size=window_size,
-    )
+    with nvtx_range("dsv4/forward_prepare"):
+        q, kv_cache, compressed, topk_idx = model.forward_prepare(
+            x, positions, freqs, kv_cache
+        )
+    with nvtx_range("dsv4/gather_keys (SWA U compressed)"):
+        keys = model.gather_keys(
+            positions,
+            kv_cache,
+            compressed,
+            topk_idx,
+            use_indexer=use_indexer,
+            use_compressor=use_compressor,
+            window_size=window_size,
+        )
     scale = cfg.head_dim**-0.5
     sink = model.attn_sink if sink_value > -1e20 else None
-    o = dsv4_combined_attention(
-        backend, q, keys, softmax_scale=scale, attn_sink=sink
-    )
-    y = model.forward_out(o, positions, freqs)
+    with nvtx_range("dsv4/combined_attention (SWA U compressed softmax)"):
+        o = dsv4_combined_attention(
+            backend, q, keys, softmax_scale=scale, attn_sink=sink
+        )
+    with nvtx_range("dsv4/forward_out (inv-rope->grouped GEMM->wo_b)"):
+        y = model.forward_out(o, positions, freqs)
     return {
         "x": x,
         "q": q,
