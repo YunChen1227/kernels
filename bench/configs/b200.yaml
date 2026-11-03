@@ -1,0 +1,18 @@
+# B200 / GB200 (sm_100): adds trtllm-gen decode (GQA + MLA) and FlashMLA sm100; FA3 is sm_90 only.
+run:
+  models: [qwen3-8b, qwen3-30b-a3b, deepseek-v3, deepseek-v3.2-dsa, deepseek-v4.1-flash,
+           glm-4.5-air, gpt-oss-120b, gemma-3-12b]
+  ops: all
+  modes: [eager, cudagraph]
+  grid: full
+  moe_expert_cap: 64
+  block_impl: {rmsnorm: flashinfer, rope: flashinfer, act: flashinfer, moe: flashinfer_cutlass}
+
+e2e:
+  batch_sizes: [1, 8, 32, 128]
+  input_lens: [1024, 4096]
+  output_lens: [256]
+  models:
+    - {name: qwen3-8b, model_path: Qwen/Qwen3-8B, tp: 1, attention_backends: [flashinfer, trtllm_mha, triton]}
+    - {name: gpt-oss-120b, model_path: openai/gpt-oss-120b, tp: 1, attention_backends: [trtllm_mha, triton]}
+    - {name: deepseek-v3, model_path: deepseek-ai/DeepSeek-V3, tp: 8, attention_backends: [trtllm_mla, flashmla, flashinfer]}

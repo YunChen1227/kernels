@@ -20,9 +20,27 @@ kernels/
   dsv4/             # extracted DSV4 + SM120 helpers
   dsa/              # extracted DSA sources (manifest only; no demo)
   demo/             # shapes, ref_ops, backends, dsv4/qsa demos, run_all
+  bench/            # model x op x backend benchmark pipeline (eager vs CUDA graph, nsys, reports)
+  profile.ps1 / profile.sh   # nsys launchers (demo capture, or `bench` cases)
   MANIFEST.md
   README.md
 ```
+
+## Benchmark pipeline (`bench/`)
+
+Models (Qwen / DeepSeek MLA·DSA·V4 / GLM / gpt-oss / Gemma / QSA) × ops (attention decode/prefill,
+rmsnorm, rope, GEMMs, MLP, MoE, one decoder layer) × backends (FlashInfer, FA2/FA3, FlashMLA,
+flash_mla_sm120, triton, trtllm-gen, sgl-kernel, torch) × workloads (batch × input_len × output_len),
+each measured eager **and** as a CUDA graph, correctness-checked against an fp32 reference first
+(flashinfer-bench semantics), timed with CUPTI. Plus sglang end-to-end eager vs CUDA graph, nsys /
+torch.profiler captures, and per-hardware HTML/Markdown reports.
+
+```bash
+python -m bench run --config bench/configs/qwen3_slice.yaml   # -> traces/<gpu>_*.jsonl
+python -m bench report traces/                                # -> reports/bench/<gpu>/report.html
+```
+
+See [bench/README.md](bench/README.md).
 
 ## Quick start (CPU — works now)
 

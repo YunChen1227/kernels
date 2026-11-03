@@ -1,0 +1,24 @@
+# RTX 50xx / RTX PRO 6000 (sm_120, e.g. the RTX 5070 Ti box): consumer Blackwell.
+# FA3 / FlashMLA (sm90/100) don't run here; flashmla_sm120 covers DSV4 sparse MLA,
+# trtllm-gen GQA decode runs via FlashInfer. Small VRAM: tighter grid + expert cap.
+run:
+  models: [qwen3-8b, qwen3.8-flash-next-qsa, deepseek-v4.1-flash, gemma-3-12b, gpt-oss-20b, glm-4-9b]
+  ops: all
+  modes: [eager, cudagraph]
+  grid: decode
+  grid_overrides:
+    batch_sizes: [1, 4, 16, 64]
+    input_lens: [1024, 4096, 16384]
+    output_lens: [1024]
+    mem_fraction: 0.5
+  moe_expert_cap: 16
+  block_impl: {rmsnorm: flashinfer, rope: flashinfer, act: flashinfer, moe: sglang_triton}
+
+e2e:
+  batch_sizes: [1, 8, 32]
+  input_lens: [1024]
+  output_lens: [256]
+  models:
+    - {name: qwen3-8b, model_path: Qwen/Qwen3-8B, tp: 1, attention_backends: [flashinfer, triton],
+       extra_args: ["--mem-fraction-static", "0.8"]}
+    - {name: gpt-oss-20b, model_path: openai/gpt-oss-20b, tp: 1, attention_backends: [triton, flashinfer]}

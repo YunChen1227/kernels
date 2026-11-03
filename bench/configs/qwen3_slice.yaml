@@ -1,0 +1,27 @@
+# Vertical slice: Qwen3-8B GQA decode on FlashInfer vs FlashAttention-2 (+ references),
+# eager and CUDA graph, plus one decoder layer around each attention backend.
+#   python -m bench run --config bench/configs/qwen3_slice.yaml
+#   python -m bench report traces/
+run:
+  models: [qwen3-8b]
+  ops: [attn_decode, decoder_layer]
+  backends: [torch_ref, sdpa, flashinfer, fa2, triton]
+  modes: [eager, cudagraph]
+  grid: decode
+  grid_overrides:
+    batch_sizes: [1, 4, 16, 64]
+    input_lens: [1024, 4096]
+    output_lens: [1024]
+    decode_kv_points: end
+  block_layers: 1
+  tag: qwen3_slice
+
+e2e:
+  batch_sizes: [1, 16, 64]
+  input_lens: [1024]
+  output_lens: [256]
+  models:
+    - name: qwen3-8b
+      model_path: Qwen/Qwen3-8B
+      tp: 1
+      attention_backends: [flashinfer, fa3, triton]

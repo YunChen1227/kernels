@@ -35,7 +35,12 @@
   Output report basename (default: reports\attn_<only>_<backend>_<timestamp>).
 
 .PARAMETER Stats
-  Also print an `nsys stats` summary (NVTX + CUDA kernel/gpukernsum) after capture.
+  Also print an `nsys stats` summary (NVTX + CUDA kernel/gpukernsum) after capture
+  and export nvtx_sum / cuda_gpu_kern_sum / cuda_api_sum CSVs next to the report.
+
+.NOTES
+  For per-kernel benchmark cases (model x op x backend, eager vs CUDA graph) use
+  `python -m bench profile ...` instead; see bench/README.md.
 
 .EXAMPLE
   # Fast CPU smoke capture
@@ -106,6 +111,7 @@ $nsysArgs = @(
     '--capture-range=cudaProfilerApi',
     '--capture-range-end=stop',
     '--cuda-memory-usage=true',
+    '--cuda-graph-trace=node',
     '--force-overwrite=true',
     '--output', $Output,
     $Python, $Driver
@@ -135,6 +141,9 @@ if ($Stats -and (Test-Path $rep)) {
     Write-Host ''
     Write-Host '=== nsys stats (NVTX + GPU kernels) ===' -ForegroundColor Cyan
     & $nsys.Source stats --report nvtx_sum --report gpukernsum $rep
+    & $nsys.Source stats --report nvtx_sum,cuda_gpu_kern_sum,cuda_api_sum --format csv `
+        --output $Output --force-export=true $rep | Out-Null
+    Write-Host "[ok] stats CSV: ${Output}_{nvtx_sum,cuda_gpu_kern_sum,cuda_api_sum}.csv"
 }
 
 Write-Host ''

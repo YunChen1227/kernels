@@ -61,6 +61,16 @@ def resolve_backend(
     raise ValueError(f"unknown backend {name!r}; expected 'cpu_ref' or 'sm120'")
 
 
+_IMPL_SEEN: dict = {}
+
+
+def _note_impl(op: str, impl: str) -> None:
+    """Print which implementation served ``op`` the first time (or when it changes)."""
+    if _IMPL_SEEN.get(op) != impl:
+        _IMPL_SEEN[op] = impl
+        print(f"  [sm120] {op} -> {impl}")
+
+
 # ---------------------------------------------------------------------------
 # QSA sparse attention
 # ---------------------------------------------------------------------------
@@ -88,23 +98,18 @@ def qsa_sparse_attention(
             q, k_cache, v_cache, token_slots, softmax_scale
         )
 
-    # SM120: prefer extracted reference on CUDA first for demo correctness;
-    # optionally try flashinfer if available.
-    try:
-        from flashinfer.decode import trtllm_batch_decode_with_kv_cache  # noqa: F401
-
-        # Full flashinfer wiring needs page tables / workspace; for the
-        # minimal demo we keep numerical parity via the torch reference on
-        # CUDA, and document the production entry point.
-        _ = trtllm_batch_decode_with_kv_cache
-    except ImportError:
-        pass
-
     from sglang.srt.layers.attention.qsa.kernel import qsa_sparse_attention_reference
 
-    return qsa_sparse_attention_reference(
-        q, k_cache, v_cache, token_slots, softmax_scale
-    )
+    scale = softmax_scale or q.shape[-1] ** -0.5
+    try:
+        from bench.ops.direct import sparse_gqa_decode
+
+        out, impl = sparse_gqa_decode(q, k_cache, v_cache, token_slots, scale)
+        _note_impl("qsa_sparse_attention", impl)
+        return out
+    except Exception as exc:
+        _note_impl("qsa_sparse_attention", f"torch reference (kernels failed: {exc})")
+    return qsa_sparse_attention_reference(q, k_cache, v_cache, token_slots, softmax_scale)
 
 
 def qsa_mqa_logits_prefill(
@@ -155,15 +160,19 @@ def dsv4_combined_attention(
     from ref_ops import sparse_mla_with_sink
 
     if backend.name == "sm120":
+        # Production DSV4 uses flash_mla_with_kvcache_sm120 on FP8 pages; the
+        # demo holds bf16 gathered keys, so run the same math on the triton /
+        # FlashInfer MLA decode kernels. bench/ops/attention_mla.py covers the
+        # FP8 FlashMLA port.
+        scale = softmax_scale or q.shape[-1] ** -0.5
         try:
-            # Production entry: flash_mla_with_kvcache_sm120 needs paged FP8
-            # caches. For the minimal random-weight demo we keep torch math on
-            # CUDA so shapes / sinks stay comparable to cpu_ref.
-            import sglang.kernels.ops.attention.flash_mla_sm120 as _fm  # noqa: F401
+            from bench.ops.direct import gathered_mqa_decode
 
-            _ = _fm
-        except Exception:
-            pass
+            out, impl = gathered_mqa_decode(q, keys, scale, attn_sink)
+            _note_impl("dsv4_combined_attention", impl)
+            return out
+        except Exception as exc:
+            _note_impl("dsv4_combined_attention", f"torch reference (kernels failed: {exc})")
 
     return sparse_mla_with_sink(
         q, keys, softmax_scale=softmax_scale, attn_sink=attn_sink

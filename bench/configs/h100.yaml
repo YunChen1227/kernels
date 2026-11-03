@@ -1,0 +1,27 @@
+# H100 / H200 (sm_90): FA3, FlashMLA, FlashInfer, triton. trtllm-gen kernels are sm_100+.
+#   python -m bench run --config bench/configs/h100.yaml
+#   python -m bench e2e --config bench/configs/h100.yaml
+run:
+  models: [qwen3-8b, qwen3-30b-a3b, deepseek-v3, deepseek-v3.2-dsa, glm-4.5-air, gpt-oss-120b,
+           gemma-3-12b, gemma-2-9b]
+  ops: all
+  modes: [eager, cudagraph]
+  grid: full
+  moe_expert_cap: 64          # big MoEs: keep weights for <=64 experts so they fit
+  block_layers: 1
+  block_impl: {rmsnorm: flashinfer, rope: flashinfer, act: flashinfer, moe: sglang_triton}
+  timing: {warmup: 10, iters: 50, trials: 3}
+
+e2e:
+  batch_sizes: [1, 8, 32, 128]
+  input_lens: [1024, 4096]
+  output_lens: [256]
+  modes: [eager, cudagraph]
+  dummy_weights: true
+  models:
+    - {name: qwen3-8b, model_path: Qwen/Qwen3-8B, tp: 1, attention_backends: [flashinfer, fa3, triton]}
+    - {name: qwen3-30b-a3b, model_path: Qwen/Qwen3-30B-A3B, tp: 1, attention_backends: [flashinfer, fa3]}
+    - {name: glm-4.5-air, model_path: zai-org/GLM-4.5-Air, tp: 4, attention_backends: [flashinfer, fa3]}
+    - {name: gpt-oss-120b, model_path: openai/gpt-oss-120b, tp: 2, attention_backends: [triton, fa3]}
+    - {name: gemma-3-12b, model_path: google/gemma-3-12b-it, tp: 1, attention_backends: [flashinfer, fa3]}
+    - {name: deepseek-v3, model_path: deepseek-ai/DeepSeek-V3, tp: 8, attention_backends: [flashmla, fa3, flashinfer]}
